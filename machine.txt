@@ -1,0 +1,294 @@
+#include <HX711_ADC.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <PID_v1.h>
+#include <EEPROM.h>
+
+// ---------------- LCD ----------------
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ---------------- HX711 ----------------
+#define HX711_DT  3
+#define HX711_SCK 2
+
+HX711_ADC LoadCell(HX711_DT , HX711_SCK);
+
+// Change this after calibration
+float calibration_factor = 198.40;
+float overshootComp = 7.0;   // grams the system dribbles after cutoff — tune this
+
+// ---------------- Buttons ----------------
+#define START_BTN 4
+#define TARE_BTN  5
+#define UP_BTN    6
+#define DOWN_BTN  7
+
+// ---------------- Rotary Encoder ----------------
+// Connect encoder CLK to A0 and DT to A1
+#define ENCODER_CLK 12
+#define ENCODER_DT  8
+
+int lastEncoderCLKState = HIGH;
+
+// ---------------- L298 Motor Driver ----------------
+#define ENA 9      // PWM pin
+#define IN1 10
+
+// ---------------- PID Variables ----------------
+double Setpoint;     // Target weight in grams
+double Input;        // Current weight in grams
+double Output;       // PWM output to pump
+
+// PID tuning values - adjust experimentally
+double Kp = 8.0;
+double Ki = 0.4;
+double Kd = 1.2;
+
+PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
+
+// ---------------- Filling Settings ----------------
+int targetWeight = 100;        // Default filling weight in grams
+int minTarget = 10;
+int maxTarget = 1000;
+
+int minPWM = 70;               // Minimum pump PWM to start flow
+int maxPWM = 255;
+
+float stopTolerance = 0.5;     // Acceptable error in grams
+float slowZone = 40.0;         // Pump slows down near target
+
+bool filling = false;
+bool processDone = false;
+
+// ---------------- Button debounce ----------------
+unsigned long lastButtonTime = 0;
+const unsigned long debounceDelay = 180;
+
+// ---------------- Timing ----------------
+unsigned long lastLCDUpdate = 0;
+const unsigned long lcdInterval = 300;
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(START_BTN, INPUT_PULLUP);
+  pinMode(TARE_BTN, INPUT_PULLUP);
+  pinMode(UP_BTN, INPUT_PULLUP);
+  pinMode(DOWN_BTN, INPUT_PULLUP);
+
+  pinMode(ENCODER_CLK, INPUT_PULLUP);
+  pinMode(ENCODER_DT, INPUT_PULLUP);
+  lastEncoderCLKState = digitalRead(ENCODER_CLK);
+
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+
+  stopPump();
+
+  lcd.begin();
+  lcd.backlight();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Liquid Filling");
+  Serial.println("Liquid Filling");
+
+  
+  lcd.setCursor(0, 1);
+  lcd.print("System Starting");
+  Serial.println("System Starting");
+  delay(1500);
+
+  LoadCell.begin();
+  LoadCell.setCalFactor(calibration_factor);
+  LoadCell.tare();
+
+  Setpoint = targetWeight;
+
+  myPID.SetMode(AUTOMATIC);
+  myPID.SetOutputLimits(0, maxPWM);
+  myPID.SetSampleTime(100);
+
+  lcd.clear();
+}
+
+void loop() {
+  readWeight();
+  handleButtons();
+  handleEncoder();
+
+  if (filling) {
+    runFillingProcess();
+  }
+
+  updateLCD();
+}
+
+// ---------------- Read Load Cell ----------------
+void readWeight() {
+  if (LoadCell.update()) {
+    Input = LoadCell.getData();
+
+    if (Input < 0) {
+      Input = 0;
+    }
+  }
+}
+
+// ---------------- Buttons ----------------
+void handleButtons() {
+  if (millis() - lastButtonTime < debounceDelay) return;
+
+  if (digitalRead(START_BTN) == LOW ) {
+    lastButtonTime = millis();
+
+    if (!filling) {
+      startFilling();
+    } else {
+      stopFilling();
+    }
+  }
+
+  if (digitalRead(TARE_BTN) == LOW && !filling) {
+    lastButtonTime = millis();
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Taring...");
+    Serial.println("Taring...");
+    LoadCell.tare();
+    delay(700);
+    processDone = false;
+  }
+
+  if (digitalRead(UP_BTN) == LOW && !filling) {
+    lastButtonTime = millis();
+
+    targetWeight += 10;
+    if (targetWeight > maxTarget) targetWeight = maxTarget;
+
+    Setpoint = targetWeight;
+    processDone = false;
+  }
+
+  if (digitalRead(DOWN_BTN) == LOW && !filling) {
+    lastButtonTime = millis();
+
+    targetWeight -= 10;
+    if (targetWeight < minTarget) targetWeight = minTarget;
+
+    Setpoint = targetWeight;
+    processDone = false;
+  }
+}
+
+// ---------------- Rotary Encoder ----------------
+void handleEncoder() {
+  if (filling) return;
+
+  int currentEncoderCLKState = digitalRead(ENCODER_CLK);
+
+  if (currentEncoderCLKState != lastEncoderCLKState) {
+    if (currentEncoderCLKState == LOW) {
+      if (digitalRead(ENCODER_DT) != currentEncoderCLKState) {
+        targetWeight += 10;
+        if (targetWeight > maxTarget) targetWeight = maxTarget;
+      } else {
+        targetWeight -= 10;
+        if (targetWeight < minTarget) targetWeight = minTarget;
+      }
+
+      Setpoint = targetWeight;
+      processDone = false;
+    }
+  }
+
+  lastEncoderCLKState = currentEncoderCLKState;
+}
+
+// ---------------- Start Filling ----------------
+void startFilling() {
+  Setpoint = targetWeight - overshootComp;
+
+  filling = true;
+  processDone = false;
+
+  myPID.SetMode(MANUAL);
+  Output = 0;
+  myPID.SetMode(AUTOMATIC);
+
+  digitalWrite(IN1, HIGH);
+}
+
+// ---------------- Stop Filling ----------------
+void stopFilling() {
+  filling = false;
+  processDone = true;
+  stopPump();
+}
+
+// ---------------- PID Filling Logic ----------------
+void runFillingProcess() {
+  float error = Setpoint - Input;
+
+  if (error <= stopTolerance) {
+    stopFilling();
+    return;
+  }
+
+  myPID.Compute();
+
+  int pwmValue = constrain((int)Output, 0, maxPWM);
+
+  /*
+    Extra correction:
+    Near the target weight, limit the maximum PWM.
+    This reduces overshoot caused by pump delay and liquid inertia.
+  */
+  if (error < slowZone) {
+    int limitedPWM = map(error, 0, slowZone, minPWM, maxPWM);
+    pwmValue = constrain(pwmValue, minPWM, limitedPWM);
+  }
+
+  if (pwmValue > 0 && pwmValue < minPWM) {
+    pwmValue = minPWM;
+  }
+
+  analogWrite(ENA, pwmValue);
+
+  Serial.print("Set: ");
+  Serial.print(Setpoint);
+  Serial.print(" g | Weight: ");
+  Serial.print(Input);
+  Serial.print(" g | PWM: ");
+  Serial.println(pwmValue);
+}
+
+// ---------------- Stop Pump ----------------
+void stopPump() {
+  analogWrite(ENA, 0);
+  digitalWrite(IN1, LOW);
+}
+
+// ---------------- LCD Display ----------------
+void updateLCD() {
+  if (millis() - lastLCDUpdate < lcdInterval) return;
+  lastLCDUpdate = millis();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Set:");
+  lcd.print(targetWeight);
+  lcd.print("g     ");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Wt:");
+  lcd.print(Input, 1);
+  lcd.print("g ");
+
+  if (filling) {
+    lcd.print("RUN ");
+  } else if (processDone) {
+    lcd.print("DONE");
+  } else {
+    lcd.print("STOP");
+  }
+}
